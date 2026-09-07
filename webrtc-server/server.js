@@ -74,7 +74,7 @@ function deliverChat({ from, fromName, to, members, content, kind, filename, mes
     // Push posielame VZDY. iOS appka si banner potlaci sama, ak ma prave
     // ten chat otvoreny (willPresent). Suspendovana appka drzi socket "OPEN"
     // este ~30s, takze by inak vyzerala online a push by neprisiel.
-    sendPushNotification(target, from, fromName || from, content, kind, 0, group);
+    sendPushNotification(target, from, fromName || from, content, kind, 0, group, messageId);
 
     if (!pendingMessages.has(target)) pendingMessages.set(target, new Map());
     const queue = pendingMessages.get(target);
@@ -94,13 +94,18 @@ function chatRecipients(data, sender) {
   return data.to ? [data.to] : [];
 }
 
-function sendPushNotification(toUser, fromUser, fromName, content, kind, urlIndex = 0, group = null) {
+function sendPushNotification(toUser, fromUser, fromName, content, kind, urlIndex = 0, group = null, messageId = null) {
   if (urlIndex >= FRAPPE_NOTIFY_URLS.length) return;
   const data = JSON.stringify({
     "to_user": toUser,
     "from_user": fromUser,
     "from_name": fromName || "Niekto",
     ...(group ? { "group_id": group.id, "group_name": group.name } : {}),
+    // ID spravy a jej typ potrebuje Frappe na evidenciu odoslanych sprav.
+    // Skupinova sprava sa sem dostane raz za kazdeho clena — vsetky maju
+    // rovnake ID, takze si podla neho vie zapisat len jeden zaznam.
+    ...(messageId ? { "message_id": messageId } : {}),
+    "kind": kind || "text",
     "content": kind === 'file' ? "📎 Poslal vám súbor" : content
   });
 
@@ -124,7 +129,7 @@ function sendPushNotification(toUser, fromUser, fromName, content, kind, urlInde
         console.log(`OK Frappe notify Success (${res.statusCode}) via ${url.hostname}`);
       } else if (userNotFound) {
         console.log(`.. ${url.hostname}: user ${toUser} not found, trying next backend`);
-        sendPushNotification(toUser, fromUser, fromName, content, kind, urlIndex + 1, group);
+        sendPushNotification(toUser, fromUser, fromName, content, kind, urlIndex + 1, group, messageId);
       } else {
         console.error(`ERR Frappe notify Error (${res.statusCode}) via ${url.hostname}:`, responseBody);
       }
