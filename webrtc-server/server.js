@@ -57,13 +57,55 @@ function chatRecipients(data, sender) {
   return data.to ? [data.to] : [];
 }
 
-function sendPushNotification(toUser, fromUser, fromName, content, kind, urlIndex = 0, group = null) {
+// Dorucenie chatovej spravy prijemcom. Pouziva to WebSocket handler aj HTTP
+// endpoint /send-chat (Share rozsirenie appky, ktore nema vlastny socket).
+function deliverChat({ from, fromName, to, members, content, kind, filename, messageId, groupId, groupName }) {
+  const targets = chatRecipients({ to, members }, from);
+  const group = groupId ? { id: groupId, name: groupName || "Skupina" } : null;
+
+  for (const target of targets) {
+    const msg = {
+      messageId, from, to: target, content, kind, filename,
+      timestamp: new Date().toISOString(),
+      ...(group ? { groupId: group.id, groupName: group.name, members } : {})
+    };
+
+    // Doruc cez socket ak je prijemca pripojeny (zivy chat vo popredi).
+    const recipient = users.get(target);
+    if (recipient && recipient.readyState === recipient.OPEN) {
+      try {
+        recipient.send(JSON.stringify({ type: "chat-message", ...msg }));
+      } catch (e) {}
+    }
+
+    // Push posielame VZDY. iOS appka si banner potlaci sama, ak ma prave
+    // ten chat otvoreny (willPresent). Suspendovana appka drzi socket "OPEN"
+    // este ~30s, takze by inak vyzerala online a push by neprisiel.
+    sendPushNotification(target, from, fromName || from, content, kind, 0, group, messageId);
+
+    if (!pendingMessages.has(target)) pendingMessages.set(target, new Map());
+    const queue = pendingMessages.get(target);
+    queue.set(messageId, msg);
+    // Strop: ak fronta prerastie limit, zahod najstarsiu spravu
+    while (queue.size > MAX_QUEUED_PER_USER) {
+      queue.delete(queue.keys().next().value);
+    }
+  }
+  return targets.length;
+}
+
+function sendPushNotification(toUser, fromUser, fromName, content, kind, urlIndex = 0, group = null, messageId = null) {
   if (urlIndex >= FRAPPE_NOTIFY_URLS.length) return;
   const data = JSON.stringify({
     "to_user": toUser,
     "from_user": fromUser,
     "from_name": fromName || "Niekto",
     ...(group ? { "group_id": group.id, "group_name": group.name } : {}),
+    // ID spravy a jej typ potrebuje Frappe na evidenciu odoslanych sprav.
+    // Skupinova sprava sa sem dostane raz za kazdeho clena — vsetky maju
+    // rovnake ID, takze si podla neho vie zapisat len jeden zaznam.
+    ...(messageId ? { "message_id": messageId } : {}),
+    "kind": kind || "text",
     "content": kind === 'file' ? "📎 Poslal vám súbor" : content
   });
 
@@ -87,7 +129,7 @@ function sendPushNotification(toUser, fromUser, fromName, content, kind, urlInde
         console.log(`OK Frappe notify Success (${res.statusCode}) via ${url.hostname}`);
       } else if (userNotFound) {
         console.log(`.. ${url.hostname}: user ${toUser} not found, trying next backend`);
-        sendPushNotification(toUser, fromUser, fromName, content, kind, urlIndex + 1, group);
+        sendPushNotification(toUser, fromUser, fromName, content, kind, urlIndex + 1, group, messageId);
       } else {
         console.error(`ERR Frappe notify Error (${res.statusCode}) via ${url.hostname}:`, responseBody);
       }
@@ -168,6 +210,31 @@ const server = createServer((req, res) => {
         res.end(JSON.stringify({ downloadUrl }));
       } catch (e) {
         res.writeHead(500); res.end(e.toString());
+      }
+    });
+    return;
+  }
+
+  // Odoslanie chatovej spravy bez WebSocketu. Sluzi Share rozsireniu iOS appky:
+  // to sa nemoze pripojit socketom pod tym istym uctom, lebo server drzi jedno
+  // spojenie na pouzivatela a odpojil by tym samotnu appku (aj pocas hovoru).
+  if (req.method === "POST" && req.url === "/send-chat") {
+    let body = "";
+    req.on("data", c => body += c);
+    req.on("end", () => {
+      try {
+        const data = JSON.parse(body);
+        if (!data.from || !data.messageId || (!data.to && !Array.isArray(data.members))) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "from, messageId a to/members su povinne" }));
+          return;
+        }
+        const delivered = deliverChat(data);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, delivered }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.toString() }));
       }
     });
     return;
@@ -409,38 +476,7 @@ wss.on("connection", (ws) => {
     }
 
     if (type === "chat-message") {
-      const { content, kind, filename, messageId, groupId, groupName } = data;
-      const targets = chatRecipients(data, username);
-      const group = groupId ? { id: groupId, name: groupName || "Skupina" } : null;
-
-      for (const to of targets) {
-        const msg = {
-          messageId, from: username, to, content, kind, filename,
-          timestamp: new Date().toISOString(),
-          ...(group ? { groupId: group.id, groupName: group.name, members: data.members } : {})
-        };
-
-        // Doruc cez socket ak je prijemca pripojeny (zivy chat vo popredi).
-        const recipient = users.get(to);
-        if (recipient && recipient.readyState === recipient.OPEN) {
-          try {
-            recipient.send(JSON.stringify({ type: "chat-message", ...msg }));
-          } catch (e) {}
-        }
-
-        // Push posielame VZDY. iOS appka si banner potlaci sama, ak ma prave
-        // ten chat otvoreny (willPresent). Suspendovana appka drzi socket "OPEN"
-        // este ~30s, takze by inak vyzerala online a push by neprisiel.
-        sendPushNotification(to, username, info.username, content, kind, 0, group);
-
-        if (!pendingMessages.has(to)) pendingMessages.set(to, new Map());
-        const queue = pendingMessages.get(to);
-        queue.set(messageId, msg);
-        // Strop: ak fronta prerastie limit, zahod najstarsiu spravu
-        while (queue.size > MAX_QUEUED_PER_USER) {
-          queue.delete(queue.keys().next().value);
-        }
-      }
+      deliverChat({ ...data, from: username, fromName: info.username });
       return;
     }
 
