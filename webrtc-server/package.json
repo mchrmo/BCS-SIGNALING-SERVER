@@ -6,7 +6,8 @@
   "description": "WebRTC signaling server with chat and S3 presigned uploads",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test-calls.mjs && node test-legacy-client.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.575.0",
