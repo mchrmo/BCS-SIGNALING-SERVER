@@ -141,6 +141,31 @@ function sendPushNotification(toUser, fromUser, fromName, content, kind, urlInde
   req.end();
 }
 
+// Presunie socket do inej miestnosti. Klient a server sa o tom, kde socket je,
+// mozu rozist (obnovene spojenie, dve pripojenia naraz). Bez presunu by
+// ucastnikovi neprisla ani ponuka spojenia a hovor by nenabehol.
+function moveToRoom(ws, info, newRoom) {
+  const oldRoom = info.roomId;
+  if (!newRoom || oldRoom === newRoom) return;
+
+  if (oldRoom) rooms.get(oldRoom)?.delete(ws);
+  if (!rooms.has(newRoom)) rooms.set(newRoom, new Set());
+  rooms.get(newRoom).add(ws);
+  info.roomId = newRoom;
+
+  const others = [...rooms.get(newRoom)]
+    .filter(p => p !== ws && meta.get(p)?.username)
+    .map(p => meta.get(p).username);
+
+  send(ws, "joined", { roomId: newRoom, username: info.username, peers: others });
+  broadcastToRoom(newRoom, ws, "peer-joined", {
+    peerId: info.username,
+    username: info.username
+  });
+  console.log("Presun: " + info.username + " " + oldRoom + " -> " + newRoom +
+              " (peers: " + others.length + ")");
+}
+
 function roomPeerCount(roomId) {
   return rooms.get(roomId)?.size || 0;
 }
@@ -399,20 +424,30 @@ wss.on("connection", (ws) => {
 
     // 🔥 NEW: Robust accept handler — queue ak caller v roomu nie je
     if (type === "accept") {
-      pendingCalls.delete(roomId);
+      // Smerujeme podla callId zo spravy, NIE podla miestnosti socketu. Ked sa
+      // predstava klienta a servera o miestnosti rozide, prijatie dorazilo tam,
+      // kde volajuci nie je - server ho odlozil ako "caller not present", po 30 s
+      // zahodil a volajucemu vypisalo "Hovor zlyhal (ICE: new)".
+      const callRoom = data.callId || roomId;
 
-      const peers = rooms.get(roomId);
+      // Volaneho zaroven presunieme do miestnosti hovoru, inak by mu neprisla
+      // ani ponuka spojenia a hovor by aj tak nenabehol.
+      if (callRoom !== info.roomId) moveToRoom(ws, info, callRoom);
+
+      pendingCalls.delete(callRoom);
+
+      const peers = rooms.get(callRoom);
       const otherPeers = peers ? [...peers].filter(p => p !== ws) : [];
 
       if (otherPeers.length > 0) {
-        broadcastToRoom(roomId, ws, "call-accepted", {
+        broadcastToRoom(callRoom, ws, "call-accepted", {
           from: username,
           callId: data.callId
         });
-        console.log(`✅ Accept delivered for room=${roomId}`);
+        console.log(`✅ Accept delivered for room=${callRoom}`);
       } else {
-        console.log(`📥 Queueing accept for room=${roomId} (caller not present)`);
-        pendingAccepts.set(roomId, {
+        console.log(`📥 Queueing accept for room=${callRoom} (caller not present)`);
+        pendingAccepts.set(callRoom, {
           callId: data.callId,
           fromUsername: username,
           timestamp: Date.now()
@@ -421,10 +456,10 @@ wss.on("connection", (ws) => {
         // Auto-cleanup po 30s
         const ts = Date.now();
         setTimeout(() => {
-          const stored = pendingAccepts.get(roomId);
+          const stored = pendingAccepts.get(callRoom);
           if (stored && stored.timestamp === ts) {
-            pendingAccepts.delete(roomId);
-            console.log(`🗑️ Expired queued accept for room=${roomId}`);
+            pendingAccepts.delete(callRoom);
+            console.log(`🗑️ Expired queued accept for room=${callRoom}`);
           }
         }, 30000);
       }
