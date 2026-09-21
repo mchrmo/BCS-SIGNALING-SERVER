@@ -172,6 +172,36 @@ console.log("\nTEST 8 — /health ukazuje zive hovory");
   check("health vracia diagnostiku", typeof j.online === "number" && Array.isArray(j.aktivne_hovory), JSON.stringify(j).slice(0, 120));
 }
 
+// ---------------------------------------------------------------- TEST 9
+console.log("\nTEST 9 — /send-chat (Share rozsirenie, bez WebSocketu)");
+logLines = [];
+{
+  const B = client("prijemca@x.sk");
+  await B.ready;
+  B.join("prijemca@x.sk"); await sleep(120);
+
+  const r = await fetch(`http://127.0.0.1:${PORT}/send-chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      from: "odosielatel@x.sk", fromName: "Odosielatel", to: "prijemca@x.sk",
+      content: "zo zdielania", kind: "text", messageId: "sm1"
+    })
+  });
+  const j = await r.json();
+  await sleep(250);
+  check("endpoint potvrdil dorucenie", j.ok === true && j.delivered === 1, JSON.stringify(j));
+  check("prijemca dostal spravu cez socket", B.has("chat-message"), B.types().join(","));
+
+  const bad = await fetch(`http://127.0.0.1:${PORT}/send-chat`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content: "bez prijemcu" })
+  });
+  check("neuplna poziadavka vrati 400", bad.status === 400, String(bad.status));
+  check("log hlasi SEND-CHAT-INVALID", logHas(/SEND-CHAT-INVALID/));
+  B.close(); await sleep(150);
+}
+
 console.log(`\n===== ${pass} OK / ${fail} ZLYHALO =====`);
 srv.kill();
 process.exit(fail ? 1 : 0);
