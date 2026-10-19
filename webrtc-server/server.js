@@ -1,6 +1,8 @@
 import { WebSocketServer } from "ws";
 import { createServer } from "http";
 import https from "https";
+import { fork } from "child_process";
+import { fileURLToPath } from "url";
 import { v4 as uuid } from "uuid";
 import {
   S3Client,
@@ -231,6 +233,83 @@ const pendingAccepts = new Map();
 // Max pocet ucastnikov v jednej hovorovej miestnosti (konferencia: ja + 4).
 const MAX_ROOM_PEERS = 5;
 
+// ===========================================================================
+// AI ZAPISOVATEL
+// ---------------------------------------------------------------------------
+// Skryty ucastnik hovoru: nahra zvuk, po hovore z neho spravi zhrnutie a ulozi
+// ho do Frappe (Dennik hovorov). Bezi ako samostatny proces (zapisovatel/),
+// takze jeho pad hovory nezhodi. Do hovoru ide LEN ked maju vsetci ucastnici
+// appku, ktora ho pozna - inak by ho videli ako dalsieho cloveka a nevedeli
+// by, ze sa hovor zapisuje. Do limitu ucastnikov ani do pravidla "ostal
+// posledny ucastnik" sa nepocita.
+// ===========================================================================
+
+const BOT_PREFIX = "ai-zapisovatel";
+const BOT_FEATURE = "ai-zapisovatel";
+const AI_ENABLED = process.env.AI_ZAPISOVATEL === "on";
+const zapisovatel = { proc: null, started: new Map(), status: null, restarts: 0 };
+
+const isBot = (username) => typeof username === "string" && username.startsWith(BOT_PREFIX);
+
+/** Ludia v miestnosti (bez zapisovatela). */
+function humanPeers(roomId) {
+  return [...(rooms.get(roomId) || [])]
+    .map(p => meta.get(p))
+    .filter(i => i?.username && !isBot(i.username));
+}
+
+function startZapisovatelProcess(port) {
+  if (!AI_ENABLED) return;
+  const missing = ["AI_SECRET", "GROQ_API_KEY", "ANTHROPIC_API_KEY", "FRAPPE_URL", "TURN_USERNAME", "TURN_CREDENTIAL"]
+    .filter(k => !process.env[k]);
+  if (missing.length && process.env.AI_DRY_RUN !== "1") {
+    logErr("AI-VYPNUTY", { dovod: `chybaju premenne ${missing.join(",")}` });
+    return;
+  }
+  const proc = fork(fileURLToPath(new URL("./zapisovatel/index.js", import.meta.url)), [], {
+    execArgv: [`--max-old-space-size=${process.env.AI_MAX_MEMORY_MB || 192}`],
+    env: { ...process.env, SIGNALING_URL: `ws://127.0.0.1:${port}/ws` }
+  });
+  zapisovatel.proc = proc;
+  const startedAt = Date.now();
+  proc.on("message", m => { if (m?.type === "status") zapisovatel.status = m; });
+  proc.on("error", e => logErr("AI-PROCES-CHYBA", { chyba: e.message }));
+  proc.on("exit", (code, signal) => {
+    zapisovatel.proc = null;
+    zapisovatel.status = null;
+    // Ked proces pada hned po starte (napr. stara verzia Node), restart sa
+    // postupne spomali az na 10 min, nech nezahlti log.
+    zapisovatel.restarts = Date.now() - startedAt > 60000 ? 0 : zapisovatel.restarts + 1;
+    const delay = Math.min(5000 * 2 ** zapisovatel.restarts, 10 * 60 * 1000);
+    logErr("AI-PROCES-SKONCIL", { kod: code, signal, restart_o: `${Math.round(delay / 1000)}s` });
+    setTimeout(() => startZapisovatelProcess(port), delay).unref?.();
+  });
+  logOk("AI-ZAPNUTY", { pid: proc.pid });
+}
+
+/** Pridaj zapisovatela do hovoru, ak je zapnuty a vsetci ludia ho poznaju. */
+function maybeStartZapisovatel(callId) {
+  if (!zapisovatel.proc || !callId || zapisovatel.started.has(callId)) return;
+  const humans = humanPeers(callId);
+  if (humans.length < 2) return;
+  zapisovatel.started.set(callId, Date.now());
+  const bezPodpory = humans.filter(i => !i.features?.includes(BOT_FEATURE)).map(i => i.username);
+  if (bezPodpory.length) {
+    logInfo("AI-PRESKOCENE", { call: callId, dovod: "stara appka", kto: bezPodpory.join(",") });
+    return;
+  }
+  zapisovatel.proc.send({ type: "start", callId });
+  logOk("AI-START", { call: callId, ucastnici: humans.length });
+}
+
+/** Do hovoru so zapisovatelom vstupil niekto so starou appkou -> nahravanie zrusit. */
+function guardZapisovatel(roomId, info) {
+  if (isBot(info.username) || !zapisovatel.proc || !zapisovatel.started.has(roomId)) return;
+  if (info.features?.includes(BOT_FEATURE)) return;
+  zapisovatel.proc.send({ type: "cancel", callId: roomId, dovod: "stara appka v hovore" });
+  logWarn("AI-ZRUSENE", { call: roomId, kto: info.username, dovod: "stara appka v hovore" });
+}
+
 // Limity offline fronty (ochrana proti rastu pamäte ak príjemca nikdy nepošle chat-ack)
 const MAX_QUEUED_PER_USER = 200;
 const MESSAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -315,6 +394,12 @@ function cancelPendingLeave(roomId, username) {
 function finalizeLeave(roomId, username, reason) {
   broadcastToRoom(roomId, null, "peer-left", { peerId: username });
 
+  if (isBot(username)) {
+    logInfo("AI-ODISIEL", { call: roomId, dovod: reason });
+    if (roomPeerCount(roomId) === 0) rooms.delete(roomId);
+    return;
+  }
+
   const stat = calls.get(roomId);
   const pending = pendingCalls.get(roomId);
 
@@ -326,7 +411,8 @@ function finalizeLeave(roomId, username, reason) {
     const n = broadcastToRoom(roomId, null, "call-ended", { from: username, callId: roomId });
     logWarn("CALL-CANCEL", { call: roomId, volajuci: username, dovod: reason, oznamene: n });
     finishCall(roomId, `volajuci odisiel: ${reason}`);
-  } else if (roomPeerCount(roomId) === 1) {
+  } else if (humanPeers(roomId).length <= 1 && roomPeerCount(roomId) > 0) {
+    // Ostal posledny clovek (pripadne uz len zapisovatel) -> koniec pre vsetkych.
     broadcastToRoom(roomId, null, "call-ended", { from: username, callId: roomId });
     logInfo("CALL-END", { call: roomId, kto: username, dovod: reason, poznamka: "ostal posledny ucastnik" });
     finishCall(roomId, `ostal posledny ucastnik (${reason})`);
@@ -356,6 +442,10 @@ function scheduleLeave(ws, roomId, username, socketId) {
   }
   if (!wasInRoom) {
     logDbg("DISCONNECT-NOT-IN-ROOM", { call: roomId, user: username, sock: socketId });
+    return;
+  }
+  if (isBot(username)) {
+    finalizeLeave(roomId, username, "socket zapisovatela spadol");
     return;
   }
 
@@ -437,6 +527,7 @@ function deliverRoomState(ws, info) {
       od: accept.fromUsername,
       cakalo: since(accept.timestamp)
     });
+    maybeStartZapisovatel(roomId);
   }
 
   return others;
@@ -536,6 +627,10 @@ const server = createServer((req, res) => {
       cakajuce_odchody: pendingLeaves.size,
       cakajuce_zvonenia: pendingCalls.size,
       cakajuce_prijatia: pendingAccepts.size,
+      zapisovatel: AI_ENABLED
+        ? { bezi: Boolean(zapisovatel.proc), nahrava: zapisovatel.status?.nahrava ?? 0,
+            vo_fronte: zapisovatel.status?.vo_fronte ?? 0, spracuva: zapisovatel.status?.spracuva ?? false }
+        : "vypnuty",
       aktivne_hovory: activeCalls
     }, null, 2));
     return;
@@ -580,6 +675,11 @@ wss.on("connection", (ws) => {
         logErr("JOIN-INVALID", { sock: shortId, roomId: newRoom, username });
         return;
       }
+      if (isBot(username) && (!process.env.AI_SECRET || data.botToken !== process.env.AI_SECRET)) {
+        logErr("BOT-ODMIETNUTY", { sock: shortId, user: username, room: newRoom });
+        ws.close();
+        return;
+      }
 
       const oldRoom = info.roomId;
 
@@ -587,8 +687,9 @@ wss.on("connection", (ws) => {
       // sa nepocita — stary socket sa o chvilu zavrie.
       if (!rooms.has(newRoom)) rooms.set(newRoom, new Set());
       const existing = [...rooms.get(newRoom)]
-        .filter(p => p !== ws && meta.get(p)?.username && meta.get(p).username !== username);
-      if (existing.length >= MAX_ROOM_PEERS) {
+        .filter(p => p !== ws && meta.get(p)?.username && meta.get(p).username !== username
+          && !isBot(meta.get(p).username));
+      if (!isBot(username) && existing.length >= MAX_ROOM_PEERS) {
         logWarn("ROOM-FULL", { call: newRoom, odmietnuty: username, max: MAX_ROOM_PEERS });
         send(ws, "room-full", { roomId: newRoom, max: MAX_ROOM_PEERS });
         return;
@@ -602,6 +703,8 @@ wss.on("connection", (ws) => {
 
       info.roomId = newRoom;
       info.username = username;
+      // Co appka podporuje (napr. "ai-zapisovatel"). Stare appky neposielaju nic.
+      info.features = Array.isArray(data.features) ? data.features : [];
       rooms.get(newRoom).add(ws);
 
       // Vratil sa po vypadku spojenia? Zrus napanovany odchod — hovor pokracuje.
@@ -633,6 +736,7 @@ wss.on("connection", (ws) => {
       users.set(username, ws);
 
       const others = deliverRoomState(ws, info);
+      if (isCallRoom(newRoom, username)) guardZapisovatel(newRoom, info);
 
       log(isCallRoom(newRoom, username) ? "📞" : "•", "JOIN", {
         user: username,
@@ -723,6 +827,7 @@ wss.on("connection", (ws) => {
           dorucene: otherPeers.length,
           zvonilo: since(s.startedAt)
         });
+        maybeStartZapisovatel(callRoom);
       } else {
         const ts = Date.now();
         pendingAccepts.set(callRoom, { callId: data.callId, fromUsername: username, timestamp: ts });
@@ -956,6 +1061,9 @@ const cleanupInterval = setInterval(function cleanupPending() {
     }
     if (queue.size === 0) pendingMessages.delete(user);
   }
+  for (const [callId, at] of zapisovatel.started) {
+    if (now - at > 6 * 60 * 60 * 1000) zapisovatel.started.delete(callId);
+  }
 }, 60 * 60 * 1000);
 
 wss.on('close', function close() {
@@ -965,8 +1073,9 @@ wss.on('close', function close() {
 });
 
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, () =>
-  console.log(`🚀 Signaling + Chat + Calls running on :${PORT} (grace=${RECONNECT_GRACE_MS}ms)`)
-);
+server.listen(PORT, () => {
+  console.log(`🚀 Signaling + Chat + Calls running on :${PORT} (grace=${RECONNECT_GRACE_MS}ms)`);
+  startZapisovatelProcess(PORT);
+});
 
 export { server, wss };
