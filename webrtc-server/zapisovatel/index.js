@@ -8,7 +8,8 @@ import os from "node:os";
 import path from "node:path";
 import { nahravajHovor } from "./bot.js";
 import { spracujHovor, ulozStav } from "./spracovanie.js";
-import { logInfo, logWarn, logErr } from "./log.js";
+import ffmpegPath from "ffmpeg-static";
+import { logInfo, logOk, logWarn, logErr } from "./log.js";
 
 const BASE = path.join(os.tmpdir(), "zapisovatel");
 const MAX_SUBEZNE = Number(process.env.AI_MAX_HOVOROV || 3);
@@ -99,12 +100,19 @@ async function start(callId) {
   processQueue();
 }
 
+// Chyba v jednom hovore nesmie zhodit cely proces (a s nim aj ostatne hovory).
+process.on("unhandledRejection", (e) => logErr("AI-NEOSETRENA-CHYBA", { chyba: e?.message || String(e) }));
+process.on("uncaughtException", (e) => logErr("AI-NEOSETRENA-VYNIMKA", { chyba: e?.message || String(e) }));
+
 process.on("message", (m) => {
   if (m?.type === "start" && m.callId) start(m.callId);
   if (m?.type === "cancel" && m.callId) active.get(m.callId)?.cancel?.(m.dovod);
 });
 // Server skoncil -> skonci aj zapisovatel (inak by ostal visiet ako sirota).
 process.on("disconnect", () => process.exit(0));
+
+if (ffmpegPath && fs.existsSync(ffmpegPath)) logOk("AI-FFMPEG", { cesta: ffmpegPath });
+else logErr("AI-FFMPEG", { dovod: "ffmpeg chyba - npm install ho nestiahol", cesta: ffmpegPath });
 
 // Po starte nic nenahravame, takze vsetko v BASE su zvysky po pade.
 sweep(0);

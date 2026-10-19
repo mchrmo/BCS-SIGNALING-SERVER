@@ -74,7 +74,9 @@ export function nahravajHovor(callId, { signalingUrl, secret, iceServers, baseDi
       for (const conn of all) await closeConn(conn);
 
       const tracks = all
-        .filter(c => c.packets > 0 && fs.existsSync(c.file))
+        // Aspon ~1 s zvuku (50 paketov po 20 ms) - kratsie spojenie (napr. tesne
+        // pred zavesenim) necha po sebe len neuplny subor.
+        .filter(c => c.packets >= 50 && fs.existsSync(c.file) && fs.statSync(c.file).size > 2048)
         .map(c => ({
           email: c.email,
           name: names.get(c.email) || c.email,
@@ -106,13 +108,17 @@ export function nahravajHovor(callId, { signalingUrl, secret, iceServers, baseDi
 
       conn.pc.onTrack.subscribe(async (track) => {
         if (track.kind !== "audio" || conn.recorder || conn.closed) return;
-        track.onReceiveRtp.subscribe(() => {
-          conn.packets++;
-          if (!conn.firstRtpAt) conn.firstRtpAt = Date.now();
-        });
-        conn.recorder = new MediaRecorder({ path: conn.file, numOfTracks: 1 });
-        conn.recorder.onError.subscribe((e) => logErr("AI-NAHRAVKA-CHYBA", { call: callId, chyba: e.message }));
-        await conn.recorder.addTrack(track);
+        try {
+          track.onReceiveRtp.subscribe(() => {
+            conn.packets++;
+            if (!conn.firstRtpAt) conn.firstRtpAt = Date.now();
+          });
+          conn.recorder = new MediaRecorder({ path: conn.file, numOfTracks: 1 });
+          conn.recorder.onError.subscribe((e) => logErr("AI-NAHRAVKA-CHYBA", { call: callId, chyba: e.message }));
+          await conn.recorder.addTrack(track);
+        } catch (e) {
+          logErr("AI-NAHRAVKA-CHYBA", { call: callId, od: from, chyba: e.message });
+        }
       });
       conn.pc.connectionStateChange.subscribe((state) => {
         const data = { call: callId, od: from, stav: state };

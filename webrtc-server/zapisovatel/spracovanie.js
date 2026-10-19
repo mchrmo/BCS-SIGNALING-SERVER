@@ -28,7 +28,8 @@ function run(args, { onStdout } = {}) {
     p.stderr.on("data", d => { err += d.toString(); });
     if (onStdout) p.stdout.on("data", onStdout);
     p.on("error", reject);
-    p.on("close", code => code === 0 ? resolve() : reject(new Error(`ffmpeg ${code}: ${err.slice(-300)}`)));
+    p.on("close", code => code === 0 ? resolve()
+      : reject(new Error(`ffmpeg ${code}: ${err.slice(-300).replace(/\s+/g, " ").trim()}`)));
   });
 }
 
@@ -280,11 +281,22 @@ export async function spracujHovor(v) {
   try {
     const lines = [];
     let speechS = 0;
+    // Jedna poskodena stopa (napr. spojenie nabehlo tesne pred zavesenim
+    // a subor ostal neuplny) nesmie zhodit cely hovor - preskoci sa.
+    let failed = 0;
+    let lastError = null;
     for (const [i, track] of v.tracks.entries()) {
-      const r = await transcribeTrack(track, v.dir, i);
-      lines.push(...r.lines);
-      speechS += r.speechS;
+      try {
+        const r = await transcribeTrack(track, v.dir, i);
+        lines.push(...r.lines);
+        speechS += r.speechS;
+      } catch (e) {
+        failed++;
+        lastError = e;
+        logWarn("AI-STOPA-PRESKOCENA", { call: callId, stopa: i + 1, chyba: e.message.slice(0, 200) });
+      }
     }
+    if (failed && failed === v.tracks.length) throw lastError;
     lines.sort((x, y) => x.t - y.t);
     const words = lines.reduce((n, l) => n + l.text.split(/\s+/).length, 0);
     logInfo("AI-PREPIS", { call: callId, stopy: v.tracks.length, rec: `${Math.round(speechS)}s`, riadky: lines.length, slova: words });
@@ -305,6 +317,8 @@ export async function spracujHovor(v) {
     logOk("AI-SPRACOVANE", { call: callId, trvalo: `${Math.round((Date.now() - started) / 1000)}s` });
   } catch (e) {
     logErr("AI-SPRACOVANIE-ZLYHALO", { call: callId, chyba: e.message });
-    await ulozStav(callId, "Chyba");
+    // Technicka pricina ide aj do Frappe, nech sa da zistit bez pristupu k logu.
+    // Chybove hlasky (ffmpeg, Groq, Claude) neobsahuju nic z hovoru.
+    await ulozStav(callId, "Chyba", `Technická chyba (pre vývojára): ${e.message}`.slice(0, 500));
   }
 }
