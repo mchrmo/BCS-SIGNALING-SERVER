@@ -202,6 +202,57 @@ logLines = [];
   B.close(); await sleep(150);
 }
 
+// ---------------------------------------------------------------- TEST 10
+console.log("\nTEST 10 — volajuci zrusi skor, nez vstupi do miestnosti (appka cakala na server)");
+logLines = [];
+{
+  const A = client("a@x.sk"), B = client("b@x.sk");
+  await Promise.all([A.ready, B.ready]);
+  A.join("a@x.sk"); await sleep(100);                     // volajuci je stale v idle miestnosti
+  A.send({ type: "cancel-call", callId: "CALL-10" }); await sleep(120);
+  check("log hlasi CALL-CANCEL-SKORO", logHas(/CALL-CANCEL-SKORO call=CALL-10/));
+  B.join("CALL-10"); await sleep(150);                    // push dorazil neskor, volany sa pripaja
+  check("volany po vstupe hned dostal call-ended", B.has("call-ended"), B.types().join(","));
+  check("volanemu NEzvoni (ziadny incoming-call)", !B.has("incoming-call"));
+  A.close(); B.close(); await sleep(150);
+}
+
+// ---------------------------------------------------------------- TEST 11
+console.log("\nTEST 11 — volajuci zrusi vyzvananie, volany sa pripoji az potom");
+logLines = [];
+{
+  const A = client("a@x.sk"), B = client("b@x.sk");
+  await Promise.all([A.ready, B.ready]);
+  A.join("CALL-11"); await sleep(100);
+  A.send({ type: "call", callId: "CALL-11", callerName: "Ander" }); await sleep(100);
+  A.send({ type: "leave" }); await sleep(150);            // zrusenie, volany este nie je v miestnosti
+  check("log hlasi CALL-CANCEL", logHas(/CALL-CANCEL call=CALL-11/));
+  B.join("CALL-11"); await sleep(150);
+  check("neskoro pripojeny volany dostal call-ended", B.has("call-ended"), B.types().join(","));
+  check("log hlasi CALL-UZ-SKONCIL", logHas(/CALL-UZ-SKONCIL call=CALL-11/));
+  B.got.length = 0;
+  B.send({ type: "accept", callId: "CALL-11" }); await sleep(150);
+  check("prijatie zruseneho hovoru vrati call-ended", B.has("call-ended"), B.types().join(","));
+  check("prijatie nie je odlozene ako ORPHANED", !logHas(/ACCEPT-ORPHANED call=CALL-11/));
+  A.close(); B.close(); await sleep(150);
+}
+
+// ---------------------------------------------------------------- TEST 12
+console.log("\nTEST 12 — bezny hovor po zmenach stale funguje (novy callId)");
+logLines = [];
+{
+  const A = client("a@x.sk"), B = client("b@x.sk");
+  await Promise.all([A.ready, B.ready]);
+  A.join("CALL-12"); B.join("CALL-12"); await sleep(120);
+  A.send({ type: "call", callId: "CALL-12", callerName: "Ander" }); await sleep(120);
+  check("volany dostal incoming-call", B.has("incoming-call"));
+  check("volany NEdostal call-ended", !B.has("call-ended"));
+  B.send({ type: "accept", callId: "CALL-12" }); await sleep(120);
+  check("volajuci dostal call-accepted", A.has("call-accepted"));
+  A.send({ type: "leave" }); B.send({ type: "leave" }); await sleep(150);
+  A.close(); B.close(); await sleep(150);
+}
+
 console.log(`\n===== ${pass} OK / ${fail} ZLYHALO =====`);
 srv.kill();
 process.exit(fail ? 1 : 0);

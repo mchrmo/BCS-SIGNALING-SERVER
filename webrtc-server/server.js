@@ -320,6 +320,22 @@ const MESSAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RECONNECT_GRACE_MS = Number(process.env.RECONNECT_GRACE_MS || 8000);
 const pendingLeaves = new Map();       // "room|username" -> { timer }
 
+// Hovory, ktore uz skoncili (zrusene volajucim alebo dohovorene). Kto do
+// takej miestnosti vstupi neskor - VoIP push meskal, telefon sa pripajal pomaly
+// alebo volajuci zrusil skor, nez vobec vstupil do miestnosti - hned dostane
+// call-ended. Inak mu zvonilo dalej a po prijati bol v hovore sam.
+const endedCalls = new Map();          // callId -> kedy skoncil
+const ENDED_TTL_MS = 5 * 60 * 1000;
+
+function markCallEnded(callId) {
+  if (callId) endedCalls.set(callId, Date.now());
+}
+
+function isCallEnded(callId) {
+  const at = endedCalls.get(callId);
+  return Boolean(at) && Date.now() - at < ENDED_TTL_MS;
+}
+
 function roomPeerCount(roomId) {
   return rooms.get(roomId)?.size || 0;
 }
@@ -409,11 +425,13 @@ function finalizeLeave(roomId, username, reason) {
     pendingCalls.delete(roomId);
     pendingAccepts.delete(roomId);
     const n = broadcastToRoom(roomId, null, "call-ended", { from: username, callId: roomId });
+    markCallEnded(roomId);
     logWarn("CALL-CANCEL", { call: roomId, volajuci: username, dovod: reason, oznamene: n });
     finishCall(roomId, `volajuci odisiel: ${reason}`);
   } else if (humanPeers(roomId).length <= 1 && roomPeerCount(roomId) > 0) {
     // Ostal posledny clovek (pripadne uz len zapisovatel) -> koniec pre vsetkych.
     broadcastToRoom(roomId, null, "call-ended", { from: username, callId: roomId });
+    markCallEnded(roomId);
     logInfo("CALL-END", { call: roomId, kto: username, dovod: reason, poznamka: "ostal posledny ucastnik" });
     finishCall(roomId, `ostal posledny ucastnik (${reason})`);
   } else {
@@ -423,6 +441,7 @@ function finalizeLeave(roomId, username, reason) {
 
   if (roomPeerCount(roomId) === 0) {
     rooms.delete(roomId);
+    markCallEnded(roomId);
     finishCall(roomId, `miestnost prazdna (${reason})`);
   }
 }
@@ -498,6 +517,12 @@ function deliverRoomState(ws, info) {
     .map(p => meta.get(p).username);
 
   send(ws, "joined", { roomId, username: info.username, peers: others });
+
+  if (isCallRoom(roomId, info.username) && isCallEnded(roomId) && !isBot(info.username)) {
+    send(ws, "call-ended", { from: "server", callId: roomId });
+    logWarn("CALL-UZ-SKONCIL", { call: roomId, pre: info.username, poznamka: "vstup do skonceneho hovoru" });
+    return others;
+  }
   broadcastToRoom(roomId, ws, "peer-joined", {
     peerId: info.username,
     username: info.username
@@ -753,6 +778,21 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // Volajuci zrusil hovor skor, nez vobec vstupil do jeho miestnosti (appka
+    // este cakala na server). Volanemu uz ale prisiel push a zvoni mu.
+    // Smeruje sa podla callId zo spravy, socket moze byt este v idle miestnosti.
+    if (type === "cancel-call") {
+      const callId = data.callId;
+      if (!callId) return;
+      markCallEnded(callId);
+      pendingCalls.delete(callId);
+      pendingAccepts.delete(callId);
+      const n = broadcastToRoom(callId, ws, "call-ended", { from: info.username, callId });
+      logWarn("CALL-CANCEL-SKORO", { call: callId, volajuci: info.username, oznamene: n });
+      finishCall(callId, "volajuci zrusil pred vstupom do miestnosti");
+      return;
+    }
+
     const { roomId, username } = info;
     if (!roomId) {
       logWarn("MSG-BEFORE-JOIN", { sock: shortId, typ: type });
@@ -799,6 +839,12 @@ wss.on("connection", (ws) => {
       // predstava klienta a servera o miestnosti rozide, prijatie by dorazilo tam,
       // kde volajuci nie je.
       const callRoom = data.callId || roomId;
+
+      if (isCallEnded(callRoom)) {
+        send(ws, "call-ended", { from: "server", callId: callRoom });
+        logWarn("ACCEPT-SKONCENY", { call: callRoom, prijal: username, poznamka: "volajuci uz zrusil" });
+        return;
+      }
 
       if (callRoom !== info.roomId) {
         if (info.roomId) explicitLeave(ws, info.roomId, username, `prijatie hovoru ${callRoom}`);
@@ -861,6 +907,7 @@ wss.on("connection", (ws) => {
       pendingCalls.delete(roomId);
       pendingAccepts.delete(roomId);
       const n = broadcastToRoom(roomId, ws, "call-ended", { from: username, callId: data.callId || roomId });
+      markCallEnded(data.callId || roomId);
       logInfo("HANGUP", { call: roomId, kto: username, typ: type, oznamene: n });
       finishCall(roomId, `${type} od ${username}`);
       return;
@@ -1060,6 +1107,9 @@ const cleanupInterval = setInterval(function cleanupPending() {
       }
     }
     if (queue.size === 0) pendingMessages.delete(user);
+  }
+  for (const [callId, at] of endedCalls) {
+    if (now - at > ENDED_TTL_MS) endedCalls.delete(callId);
   }
   for (const [callId, at] of zapisovatel.started) {
     if (now - at > 6 * 60 * 60 * 1000) zapisovatel.started.delete(callId);
