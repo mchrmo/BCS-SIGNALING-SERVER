@@ -4,6 +4,7 @@
 //   3. stopy zlozi do dialogu "Meno: text" podla casu
 //   4. Claude z dialogu spravi zhrnutie
 //   5. zhrnutie ulozi do Frappe (Dennik hovorov)
+//   6. zhrnutie posle do n8n, ak je nastavene N8N_WEBHOOK_URL (karty v Trelle)
 // Subory hovoru maze volajuci (index.js) vzdy, aj ked tu nieco zlyha.
 
 import fs from "node:fs";
@@ -12,6 +13,7 @@ import { spawn } from "node:child_process";
 import ffmpegPath from "ffmpeg-static";
 import Anthropic from "@anthropic-ai/sdk";
 import { logInfo, logOk, logWarn, logErr } from "./log.js";
+import { posliDoN8n, ucastniciZoStop } from "./n8n.js";
 
 const DRY_RUN = process.env.AI_DRY_RUN === "1";
 const SAMPLE_RATE = 16000;
@@ -314,6 +316,8 @@ export async function spracujHovor(v) {
     const participants = [...new Set(v.tracks.map(t => t.name))];
     const zhrnutie = await summarize(callId, transcript, participants);
     await ulozStav(callId, "Hotové", zhrnutie);
+    // Systém úloh: z hotového zhrnutia spraví n8n karty v Trelle (nezávisle od Frappe).
+    await posliDoN8n(callId, zhrnutie, ucastniciZoStop(v.tracks));
     logOk("AI-SPRACOVANE", { call: callId, trvalo: `${Math.round((Date.now() - started) / 1000)}s` });
   } catch (e) {
     logErr("AI-SPRACOVANIE-ZLYHALO", { call: callId, chyba: e.message });
