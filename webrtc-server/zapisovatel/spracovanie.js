@@ -14,6 +14,7 @@ import ffmpegPath from "ffmpeg-static";
 import Anthropic from "@anthropic-ai/sdk";
 import { logInfo, logOk, logWarn, logErr } from "./log.js";
 import { posliDoN8n, ucastniciZoStop } from "./n8n.js";
+import { ulozStav } from "./frappe.js";
 
 const DRY_RUN = process.env.AI_DRY_RUN === "1";
 const SAMPLE_RATE = 16000;
@@ -239,33 +240,8 @@ async function summarize(callId, transcript, participants) {
 
 // ---------------------------------------------------------------- 5. Frappe
 
-export async function ulozStav(callId, stav, zhrnutie = "") {
-  if (DRY_RUN) {
-    logInfo("AI-ULOZENIE-NASUCHO", { call: callId, stav });
-    return true;
-  }
-  const url = `${process.env.FRAPPE_URL.replace(/\/$/, "")}/api/method/bcservices.api.call.save_ai_summary`;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-AI-Secret": process.env.AI_SECRET },
-        body: JSON.stringify({ callId, stav, zhrnutie })
-      });
-      const body = await res.json().catch(() => ({}));
-      if (res.ok && body.message?.success) {
-        logOk("AI-ULOZENE", { call: callId, stav });
-        return true;
-      }
-      logWarn("AI-ULOZENIE-ZLYHALO", { call: callId, status: res.status, chyba: body.message?.error, pokus: attempt });
-      if (res.status === 403 || body.message?.error) return false;   // opakovanie nepomoze
-    } catch (e) {
-      logWarn("AI-ULOZENIE-ZLYHALO", { call: callId, chyba: e.message, pokus: attempt });
-    }
-    await sleep([2000, 5000, 15000][attempt - 1]);
-  }
-  return false;
-}
+// Zapis do Frappe je v frappe.js (REST s API klucom alebo endpoint s AI_SECRET).
+export { ulozStav };
 
 // ---------------------------------------------------------------- spolu
 
